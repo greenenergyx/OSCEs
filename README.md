@@ -21,11 +21,16 @@ pip install -r requirements.txt
 streamlit run streamlit_app.py
 ```
 
-3. In the app sidebar, upload or provide paths to:
+3. In the app sidebar, the app will automatically search for:
    - `Radiopaedia_Library.xlsx`
    - `sample_radiopedia_articles.csv`
+   inside the default folder `/content/drive/MyDrive/Gem` and its subfolders.
 
-4. Configure generation settings and click `Generate OSCE cases`.
+4. If needed, upload files manually or change the default path.
+
+5. Add your Gemini API key in the sidebar to enable AI-enriched answers.
+
+6. Configure generation settings and click `Generate OSCE cases`.
 
 ## Notes
 

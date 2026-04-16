@@ -1,12 +1,15 @@
 import os
 import random
 import re
+import logging
+import requests
 import pandas as pd
 import streamlit as st
 
 DEFAULT_DATA_DIR = "/content/drive/MyDrive/Gem"
 XLSX_NAME = "Radiopaedia_Library.xlsx"
 CSV_NAME = "sample_radiopedia_articles.csv"
+GEMINI_MODEL = "text-bison-001"
 
 st.set_page_config(
     page_title="Radiology OSCE Case Generator",
@@ -41,6 +44,76 @@ def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return df[required_columns].copy()
 
 
+def find_drive_files(data_dir: str) -> dict:
+    files = {}
+    if not os.path.isdir(data_dir):
+        return files
+
+    for root, _, filenames in os.walk(data_dir):
+        for filename in filenames:
+            if filename == XLSX_NAME:
+                files["excel"] = os.path.join(root, filename)
+            elif filename == CSV_NAME:
+                files["csv"] = os.path.join(root, filename)
+        if "excel" in files and "csv" in files:
+            break
+    return files
+
+
+def call_gemini_api(prompt: str, api_key: str) -> str:
+    url = f"https://gemini.googleapis.com/v1/models/{GEMINI_MODEL}:generate"
+    payload = {
+        "prompt": {"text": prompt},
+        "temperature": 0.7,
+        "maxOutputTokens": 512,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    response = requests.post(url, headers=headers, json=payload, timeout=20)
+    response.raise_for_status()
+    data = response.json()
+
+    if isinstance(data, dict) and data.get("candidates"):
+        return data["candidates"][0].get("output", "")
+    if isinstance(data, dict) and data.get("output"):
+        return data["output"]
+
+    raise ValueError("Unexpected Gemini response format")
+
+
+def enrich_with_gemini(article: pd.Series, hidden_answer: str, custom_notes: str, api_key: str) -> str:
+    title = str(article.get("title", "Untitled case")).strip()
+    system = str(article.get("system", "General radiology")).strip()
+    section = str(article.get("section", "")).strip()
+    content = str(article.get("content", "")).strip()
+    findings_prompt = extract_case_findings(article)
+
+    prompt = (
+        "You are a radiology educator creating an OSCE case answer. "
+        "Use the following case details to write a concise teaching answer that includes diagnosis, key imaging findings, "
+        "differential diagnosis, and the next best management step.\n\n"
+        f"Title: {title}\n"
+        f"System: {system}\n"
+        f"Section: {section}\n"
+        f"Findings prompt: {findings_prompt}\n"
+        f"Case content: {content[:1500]}\n"
+    )
+
+    if custom_notes:
+        prompt += f"Additional reference notes: {custom_notes}\n"
+
+    prompt += "\nProvide the answer in clear exam-style teaching language."
+
+    try:
+        return call_gemini_api(prompt, api_key).strip()
+    except Exception as exc:
+        logging.warning(f"Gemini AI enrich failed: {exc}")
+        return f"{hidden_answer}\n\n[AI enrichment unavailable: {exc}]"
+
+
 def extract_case_findings(row: pd.Series) -> str:
     content = str(row.get("content", ""))
     if not content.strip():
@@ -62,7 +135,7 @@ def build_marking_grid() -> pd.DataFrame:
     return pd.DataFrame(rubric)
 
 
-def generate_osce_case(article: pd.Series, case_number: int, custom_notes: str, include_grid: bool) -> dict:
+def generate_osce_case(article: pd.Series, case_number: int, custom_notes: str, include_grid: bool, gemini_key: str = "") -> dict:
     title = str(article.get("title", "Untitled case")).strip()
     system = str(article.get("system", "General radiology")).strip()
     section = str(article.get("section", "")).strip()
@@ -87,6 +160,9 @@ def generate_osce_case(article: pd.Series, case_number: int, custom_notes: str, 
 
     if custom_notes:
         hidden_answer += f"\nReference notes: {custom_notes}"
+
+    if gemini_key:
+        hidden_answer = enrich_with_gemini(article, hidden_answer, custom_notes, gemini_key)
 
     case = {
         "case_id": case_number,
@@ -148,6 +224,13 @@ def load_data_paths(data_dir: str, excel_uploaded, csv_uploaded):
                 excel_df = load_dataframe_from_excel(excel_path)
             except Exception as exc:
                 problems.append(f"Could not load Excel from {excel_path}: {exc}")
+        else:
+            found = find_drive_files(data_dir).get("excel")
+            if found:
+                try:
+                    excel_df = load_dataframe_from_excel(found)
+                except Exception as exc:
+                    problems.append(f"Could not load Excel from {found}: {exc}")
 
     if csv_uploaded is not None:
         try:
@@ -162,6 +245,13 @@ def load_data_paths(data_dir: str, excel_uploaded, csv_uploaded):
                 csv_df = load_dataframe_from_csv(csv_path)
             except Exception as exc:
                 problems.append(f"Could not load CSV from {csv_path}: {exc}")
+        else:
+            found = find_drive_files(data_dir).get("csv")
+            if found:
+                try:
+                    csv_df = load_dataframe_from_csv(found)
+                except Exception as exc:
+                    problems.append(f"Could not load CSV from {found}: {exc}")
 
     return excel_df, csv_df, problems
 
@@ -184,6 +274,8 @@ def main():
         system_filter = st.text_input("Filter by system keyword", value="")
         custom_notes = st.text_area("Reference / enrichment notes", help="Add any guidance from your radiology books or notes.")
         include_grid = st.checkbox("Include marking grid", value=True)
+        use_gemini = st.checkbox("Use Gemini AI for answer enrichment", value=False)
+        gemini_key = st.text_input("Gemini API key", type="password", help="Enter your Gemini API key to generate enriched answers.")
         generate_button = st.button("Generate OSCE cases")
 
     excel_df, csv_df, problems = load_data_paths(data_dir, excel_file, csv_file)
@@ -223,9 +315,12 @@ def main():
         selected = selected.reset_index(drop=True)
 
         generated_cases = []
+        if use_gemini and not gemini_key:
+            st.warning("Please provide a Gemini API key to enable AI enrichment.")
+
         for i, row in selected.iterrows():
             generated_cases.append(
-                generate_osce_case(row, i + 1, custom_notes, include_grid)
+                generate_osce_case(row, i + 1, custom_notes, include_grid, gemini_key if use_gemini else "")
             )
 
         st.success(f"Generated {len(generated_cases)} OSCE cases.")
